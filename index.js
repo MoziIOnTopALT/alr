@@ -10,7 +10,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 15000);
+const HEARTBEAT_TIMEOUT_MS = Number(
+  process.env.HEARTBEAT_TIMEOUT_MS || 15000
+);
 const PROTECTOR_BASE_URL = process.env.PROTECTOR_BASE_URL; // ví dụ: https://webhook-vault-vercel.vercel.app
 const STATUS_SHARED_SECRET = process.env.STATUS_SHARED_SECRET || "";
 
@@ -40,7 +42,11 @@ function signBody(body) {
 }
 
 // ---- gọi protector để PATCH -> Disconnected ----
-async function patchMessageDisconnectedViaProtector(vaultId, messageId, embed) {
+async function patchMessageDisconnectedViaProtector(
+  vaultId,
+  messageId,
+  embed
+) {
   if (!PROTECTOR_BASE_URL) {
     throw new Error("PROTECTOR_BASE_URL missing");
   }
@@ -101,7 +107,7 @@ app.post("/register", (req, res) => {
   try {
     const {
       sessionId,
-      vaultId,        // ID trong Supabase (wh_....)
+      vaultId, // ID trong Supabase (wh_....)
       messageId,
       channelId,
       username,
