@@ -1,58 +1,81 @@
-// index.js - Status API cho SAB (Cách B: PATCH qua protector)
+// index.js - Status API (bản dùng vaultId từ Supabase, PATCH embed Disconnected)
 
-import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const HEARTBEAT_TIMEOUT_MS = Number(
-  process.env.HEARTBEAT_TIMEOUT_MS || 15000
-);
-const PROTECTOR_BASE_URL = process.env.PROTECTOR_BASE_URL; // ví dụ: https://webhook-vault-vercel.vercel.app
-const STATUS_SHARED_SECRET = process.env.STATUS_SHARED_SECRET || "";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "CHANGE_THIS_TO_A_LONG_SECRET";
 
-if (!PROTECTOR_BASE_URL) {
-  console.warn("[Status] PROTECTOR_BASE_URL not set");
-}
-if (!STATUS_SHARED_SECRET) {
-  console.warn("[Status] STATUS_SHARED_SECRET not set");
-}
+const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 15000);
 
-// lưu session trong RAM
-// session: { sessionId, vaultId, messageId, channelId, username, ..., embed, lastPing }
-const sessions = new Map();
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
 
-// ---- tạo HMAC để gọi protector ----
-function signBody(body) {
-  if (!STATUS_SHARED_SECRET) {
-    throw new Error("STATUS_SHARED_SECRET missing");
-  }
-  const ts = Date.now().toString();
-  const payload = `${ts}.${JSON.stringify(body)}`;
-  const sig = crypto
-    .createHmac("sha256", STATUS_SHARED_SECRET)
-    .update(payload)
-    .digest("hex");
-  return { ts, sig };
+// === Giải mã webhook_enc giống vault ===
+function getKey() {
+  return crypto.createHash("sha256").update(String(ENCRYPTION_KEY)).digest();
 }
 
-// ---- gọi protector để PATCH -> Disconnected ----
-async function patchMessageDisconnectedViaProtector(
-  vaultId,
-  messageId,
-  embed
-) {
-  if (!PROTECTOR_BASE_URL) {
-    throw new Error("PROTECTOR_BASE_URL missing");
+function decryptWebhook(b64) {
+  const buf = Buffer.from(b64, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const data = buf.subarray(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", getKey(), iv);
+  decipher.setAuthTag(tag);
+  const dec = Buffer.concat([decipher.update(data), decipher.final()]);
+  return dec.toString("utf8");
+}
+
+// webhookKey có thể là:
+//  - full Discord URL
+//  - hoặc id vault "wh_xxx..." trong Supabase
+async function resolveWebhook(webhookKey) {
+  if (!webhookKey) return null;
+
+  if (
+    webhookKey.startsWith("http://") ||
+    webhookKey.startsWith("https://")
+  ) {
+    return webhookKey;
   }
 
-  // clone embed & sửa field Status
+  // Coi như id trong bảng Supabase
+  const { data, error } = await supabase
+    .from("webhooks")
+    .select("webhook_enc")
+    .eq("id", webhookKey)
+    .maybeSingle();
+
+  if (error || !data) {
+    console.error("[Status] resolveWebhook error", error);
+    return null;
+  }
+
+  try {
+    return decryptWebhook(data.webhook_enc);
+  } catch (e) {
+    console.error("[Status] decryptWebhook error", e);
+    return null;
+  }
+}
+
+async function patchMessageDisconnected(webhookKey, messageId, channelId, embed) {
+  const webhookUrl = await resolveWebhook(webhookKey);
+  if (!webhookUrl) {
+    throw new Error("Cannot resolve webhook from key");
+  }
+
   const newEmbed = JSON.parse(JSON.stringify(embed || {}));
+
   if (!Array.isArray(newEmbed.fields)) {
     newEmbed.fields = [];
   }
@@ -61,11 +84,11 @@ async function patchMessageDisconnectedViaProtector(
   for (const f of newEmbed.fields) {
     if (typeof f.name === "string" && f.name.toLowerCase().includes("status")) {
       f.value = "🔴 **Disconnected**";
-      f.inline = true;
       found = true;
       break;
     }
   }
+
   if (!found) {
     newEmbed.fields.push({
       name: "Status",
@@ -74,40 +97,38 @@ async function patchMessageDisconnectedViaProtector(
     });
   }
 
-  const body = {
-    vault_id: vaultId,
-    message_id: messageId,
+  const payload = {
     embeds: [newEmbed],
   };
 
-  const { ts, sig } = signBody(body);
+  const url = `${webhookUrl}/messages/${messageId}`;
 
-  const url = `${PROTECTOR_BASE_URL}/api/status-patch`;
   const res = await fetch(url, {
-    method: "POST",
+    method: "PATCH",
     headers: {
       "Content-Type": "application/json",
-      "X-Status-Timestamp": ts,
-      "X-Status-Signature": sig,
+      "User-Agent": "Status-API",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
 
   if (!res.ok) {
     const text = await res.text();
-    console.error("[Status] PATCH via protector failed", res.status, text);
-    throw new Error("PATCH via protector failed");
+    console.error("[Status] PATCH failed", res.status, text);
+    throw new Error("PATCH failed");
   }
 }
 
-// ========== ROUTES ==========
+// ===== Sessions trong RAM =====
+const sessions = new Map();
 
 // POST /register
-app.post("/register", (req, res) => {
+app.post("/register", async (req, res) => {
   try {
     const {
       sessionId,
-      vaultId, // ID trong Supabase (wh_....)
+      vaultId,
+      webhookUrl,    // fallback nếu sau này muốn gửi thẳng webhook
       messageId,
       channelId,
       username,
@@ -117,13 +138,16 @@ app.post("/register", (req, res) => {
       embed,
     } = req.body || {};
 
-    if (!sessionId || !vaultId || !messageId || !channelId) {
+    const webhookKey = vaultId || webhookUrl;
+
+    if (!sessionId || !webhookKey || !messageId || !channelId) {
       return res.status(400).json({ error: "missing fields" });
     }
 
+    // Không resolve ngay cũng được, chỉ cần lưu key.
     sessions.set(sessionId, {
       sessionId,
-      vaultId,
+      webhookKey,
       messageId,
       channelId,
       username,
@@ -134,7 +158,7 @@ app.post("/register", (req, res) => {
       lastPing: Date.now(),
     });
 
-    console.log("[Status] Registered session", sessionId, "vault:", vaultId);
+    console.log("[Status] Registered session", sessionId);
     return res.json({ ok: true });
   } catch (err) {
     console.error("[Status] /register error", err);
@@ -165,9 +189,10 @@ setInterval(async () => {
     if (now - s.lastPing > HEARTBEAT_TIMEOUT_MS) {
       console.log("[Status] Session timeout:", sessionId);
       try {
-        await patchMessageDisconnectedViaProtector(
-          s.vaultId,
+        await patchMessageDisconnected(
+          s.webhookKey,
           s.messageId,
+          s.channelId,
           s.embed
         );
       } catch (err) {
