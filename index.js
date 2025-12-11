@@ -1,77 +1,90 @@
-// index.js - Status API (bản dùng vaultId từ Supabase, PATCH embed Disconnected)
+// index.js - Status API
 
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
+import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ==== ENV ====
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "CHANGE_THIS_TO_A_LONG_SECRET";
-
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.HEARTBEAT_TIMEOUT_MS || 15000);
 
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("[Status] Missing Supabase env");
+}
+
+// Supabase client (server-side, dùng service role key)
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
-// === Giải mã webhook_enc giống vault ===
+// ==== Decrypt giống hệt protector ====
 function getKey() {
-  return crypto.createHash("sha256").update(String(ENCRYPTION_KEY)).digest();
+  const base = ENCRYPTION_KEY || "CHANGE_THIS_TO_A_LONG_SECRET";
+  return crypto.createHash("sha256").update(String(base)).digest();
 }
 
-function decryptWebhook(b64) {
+function decrypt(b64) {
+  const key = getKey();
   const buf = Buffer.from(b64, "base64");
   const iv = buf.subarray(0, 12);
   const tag = buf.subarray(12, 28);
   const data = buf.subarray(28);
-  const decipher = crypto.createDecipheriv("aes-256-gcm", getKey(), iv);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
   const dec = Buffer.concat([decipher.update(data), decipher.final()]);
   return dec.toString("utf8");
 }
 
-// webhookKey có thể là:
-//  - full Discord URL
-//  - hoặc id vault "wh_xxx..." trong Supabase
-async function resolveWebhook(webhookKey) {
-  if (!webhookKey) return null;
+function extractVaultId(str) {
+  if (!str) return null;
+  const m = String(str).match(/wh_[0-9a-f]+/i);
+  return m ? m[0] : null;
+}
 
-  if (
-    webhookKey.startsWith("http://") ||
-    webhookKey.startsWith("https://")
-  ) {
-    return webhookKey;
+// Nếu nhận vault URL / vault id → lấy real webhook từ Supabase
+async function resolveWebhook(webhookUrlOrVault) {
+  if (!webhookUrlOrVault) return null;
+
+  // đã là Discord webhook thì trả luôn
+  if (/discord(app)?\.com\/api\/webhooks\//.test(webhookUrlOrVault)) {
+    return webhookUrlOrVault;
   }
 
-  // Coi như id trong bảng Supabase
+  const vaultId = extractVaultId(webhookUrlOrVault);
+  if (!vaultId) {
+    // Không phải vault id ⇒ cứ trả lại như cũ
+    return webhookUrlOrVault;
+  }
+
   const { data, error } = await supabase
     .from("webhooks")
     .select("webhook_enc")
-    .eq("id", webhookKey)
+    .eq("id", vaultId)
     .maybeSingle();
 
   if (error || !data) {
-    console.error("[Status] resolveWebhook error", error);
-    return null;
+    console.error("[Status] resolveWebhook supabase error:", error || "no data");
+    throw new Error("Cannot resolve webhook from vaultId");
   }
 
-  try {
-    return decryptWebhook(data.webhook_enc);
-  } catch (e) {
-    console.error("[Status] decryptWebhook error", e);
-    return null;
-  }
+  const realUrl = decrypt(data.webhook_enc);
+  return realUrl;
 }
 
-async function patchMessageDisconnected(webhookKey, messageId, channelId, embed) {
-  const webhookUrl = await resolveWebhook(webhookKey);
+// ==== PATCH message -> Disconnected ====
+async function patchMessageDisconnected(webhookOrVault, messageId, channelId, embed) {
+  const webhookUrl = await resolveWebhook(webhookOrVault);
   if (!webhookUrl) {
-    throw new Error("Cannot resolve webhook from key");
+    console.error("[Status] patch: cannot resolve webhook url");
+    return;
   }
 
   const newEmbed = JSON.parse(JSON.stringify(embed || {}));
@@ -97,10 +110,7 @@ async function patchMessageDisconnected(webhookKey, messageId, channelId, embed)
     });
   }
 
-  const payload = {
-    embeds: [newEmbed],
-  };
-
+  const payload = { embeds: [newEmbed] };
   const url = `${webhookUrl}/messages/${messageId}`;
 
   const res = await fetch(url, {
@@ -113,13 +123,13 @@ async function patchMessageDisconnected(webhookKey, messageId, channelId, embed)
   });
 
   if (!res.ok) {
-    const text = await res.text();
+    const text = await res.text().catch(() => "");
     console.error("[Status] PATCH failed", res.status, text);
     throw new Error("PATCH failed");
   }
 }
 
-// ===== Sessions trong RAM =====
+// ==== Session store (RAM) ====
 const sessions = new Map();
 
 // POST /register
@@ -127,8 +137,7 @@ app.post("/register", async (req, res) => {
   try {
     const {
       sessionId,
-      vaultId,
-      webhookUrl,    // fallback nếu sau này muốn gửi thẳng webhook
+      webhookUrl, // có thể là vault URL
       messageId,
       channelId,
       username,
@@ -138,16 +147,14 @@ app.post("/register", async (req, res) => {
       embed,
     } = req.body || {};
 
-    const webhookKey = vaultId || webhookUrl;
-
-    if (!sessionId || !webhookKey || !messageId || !channelId) {
+    if (!sessionId || !webhookUrl || !messageId || !channelId) {
       return res.status(400).json({ error: "missing fields" });
     }
 
-    // Không resolve ngay cũng được, chỉ cần lưu key.
+    // Lưu lại, khi timeout mới resolveWebhook để patch
     sessions.set(sessionId, {
       sessionId,
-      webhookKey,
+      webhookUrl,
       messageId,
       channelId,
       username,
@@ -190,7 +197,7 @@ setInterval(async () => {
       console.log("[Status] Session timeout:", sessionId);
       try {
         await patchMessageDisconnected(
-          s.webhookKey,
+          s.webhookUrl,
           s.messageId,
           s.channelId,
           s.embed
