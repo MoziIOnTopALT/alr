@@ -78,10 +78,12 @@ async function resolveWebhook(vaultOrUrl) {
 // ==== Lưu session trong RAM ====
 const sessions = new Map();
 
-// PATCH embed → Disconnected
+// PATCH embed → Disconnected (giữ đúng format code block "```🔴 Disconnected```")
 async function patchMessageDisconnected(webhookUrl, messageId, channelId, embed) {
+  // clone embed gốc để không sửa trực tiếp object đang lưu trong sessions
   const newEmbed = JSON.parse(JSON.stringify(embed || {}));
 
+  // luôn đảm bảo có mảng fields
   if (!Array.isArray(newEmbed.fields)) {
     newEmbed.fields = [];
   }
@@ -89,16 +91,19 @@ async function patchMessageDisconnected(webhookUrl, messageId, channelId, embed)
   let found = false;
   for (const f of newEmbed.fields) {
     if (typeof f.name === "string" && f.name.toLowerCase().includes("status")) {
-      f.value = "🔴 **Disconnected**";
+      // đổi value sang Disconnected với code block giống bên Lua
+      f.value = "```🔴 Disconnected```";
       found = true;
       break;
     }
   }
+
+  // Nếu embed chưa có field status thì tự thêm
   if (!found) {
     newEmbed.fields.push({
-      name: "Status",
-      value: "🔴 **Disconnected**",
-      inline: true,
+      name: "📡 Player Status",
+      value: "```🔴 Disconnected```",
+      inline: false,
     });
   }
 
