@@ -78,7 +78,7 @@ async function resolveWebhook(vaultOrUrl) {
 // ==== Lưu session trong RAM ====
 const sessions = new Map();
 
-// PATCH embed → Disconnected, hỗ trợ cả SAB & BladeBall
+// PATCH embed → Disconnected (giữ đúng format code block "```🔴 Disconnected```")
 async function patchMessageDisconnected(webhookUrl, messageId, channelId, embed) {
   // clone embed gốc để không sửa trực tiếp object đang lưu trong sessions
   const newEmbed = JSON.parse(JSON.stringify(embed || {}));
@@ -88,59 +88,25 @@ async function patchMessageDisconnected(webhookUrl, messageId, channelId, embed)
     newEmbed.fields = [];
   }
 
-  // 1. Xác định style: SAB hay Blade Ball
-  let statusValue = "```🔴 Disconnected```"; // default: kiểu code block (BladeBall)
-
-  const footerText = (newEmbed.footer && newEmbed.footer.text) || "";
-  const footerLower = footerText.toLowerCase();
-
-  // Nếu footer nói rõ là SAB thì dùng style không code block
-  if (footerLower.includes("steal a brainrot")) {
-    statusValue = "🔴 Disconnected";
-  } else {
-    // Nếu không rõ, nhìn field status hiện tại để bắt chước style
-    const existingStatusField = newEmbed.fields.find(
-      (f) =>
-        f &&
-        typeof f.name === "string" &&
-        f.name.toLowerCase().includes("status")
-    );
-
-    if (
-      existingStatusField &&
-      typeof existingStatusField.value === "string"
-    ) {
-      const v = existingStatusField.value;
-      if (v.includes("```")) {
-        // nếu đang dùng code block thì giữ style code block
-        statusValue = "```🔴 Disconnected```";
-      } else {
-        // nếu chỉ có emoji/text thì dùng plain text
-        statusValue = "🔴 Disconnected";
-      }
-    }
-  }
-
-  // 2. Gán value mới cho field Status (hoặc thêm mới nếu chưa có)
   let found = false;
   for (const f of newEmbed.fields) {
     if (typeof f.name === "string" && f.name.toLowerCase().includes("status")) {
-      f.value = statusValue;
+      // đổi value sang Disconnected với code block giống bên Lua
+      f.value = "```🔴 Disconnected```";
       found = true;
       break;
     }
   }
 
-  // Nếu embed chưa có field status thì tự thêm (cho mấy script sau này)
+  // Nếu embed chưa có field status thì tự thêm
   if (!found) {
     newEmbed.fields.push({
       name: "📡 Player Status",
-      value: statusValue,
+      value: "```🔴 Disconnected```",
       inline: false,
     });
   }
 
-  // 3. Gửi PATCH lên Discord
   const url = `${webhookUrl}/messages/${messageId}`;
 
   const res = await fetch(url, {
@@ -158,6 +124,7 @@ async function patchMessageDisconnected(webhookUrl, messageId, channelId, embed)
     throw new Error("PATCH failed");
   }
 }
+
 
 
 // POST /register
