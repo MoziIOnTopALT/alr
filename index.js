@@ -1,4 +1,4 @@
-// index.js - Status API: lấy webhook thật từ Supabase + patch Disconnected
+
 
 import express from "express";
 import cors from "cors";
